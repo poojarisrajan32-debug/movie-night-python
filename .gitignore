@@ -11,3 +11,4 @@ test-results/
 gitleaks.json
 .env
 .DS_Store
+.idea/

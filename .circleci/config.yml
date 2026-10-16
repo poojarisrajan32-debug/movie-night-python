@@ -1,63 +1,171 @@
-
 version: 2.1
 
-jobs:
-  qa:
-    docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies
-          command: |
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-            pip install pytest httpx ruff detect-secrets
-      - run:
-          name: Python quality checks
-          command: |
-            ruff check app tests
-      - run:
-          name: Run tests
-          command: |
-            pytest -q
-      - run:
-          name: Scan for secrets
-          command: |
-            detect-secrets scan --all-files \
-              --exclude-files '(^|/)(\.git|\.venv|venv)/' \
-              > /tmp/secrets-scan.json
-            cat /tmp/secrets-scan.json
-            python -c "import json,sys; d=json.load(open('/tmp/secrets-scan.json')); findings=[v for v in d.get('results',{}).values() if v]; print('Potential secrets found!' if findings else 'No potential secrets found.'); sys.exit(1 if findings else 0)"
+# What runs where:
+#   main              secret-scan -> lint -> unit -> integration -> build + push :qa
+#   staging           build + push :stage   (no tests, by design)
+#   prod              build + push :prod    (no tests, by design)
+#   any other branch  the four checks only, so a PR gets feedback and nothing is pushed
+# Each job below fails if any command in it exits non-zero, and a job only starts
+# once everything in its `requires` has passed - that is what "a failure stops the build" means.
 
-  build:
+executors:
+  py:
     docker:
-      - image: cimg/base:current
+      - image: cimg/python:3.12.4   # same Python as the Dockerfile's base image
+
+jobs:
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
     steps:
       - checkout
-      - setup_remote_docker
       - run:
-          name: Build Docker image
+          name: Install gitleaks (pinned version, checksum verified)
           command: |
-            docker build -t movie-night:${CIRCLE_SHA1} .
+            V=8.30.1
+            curl -sSL -o gitleaks.tar.gz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+            echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+            tar xzf gitleaks.tar.gz gitleaks
+      - run:
+          name: Scan the whole git history for secrets
+          command: ./gitleaks git --redact -v --no-banner .
+
+  lint:
+    executor: py
+    steps:
+      - checkout
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check .
+
+  unit-tests:
+    executor: py
+    steps:
+      - checkout
+      - run: python -m pip install -r requirements-dev.txt
+      - run:
+          name: Unit tests (voting logic needs no services)
+          command: >
+            python -m pytest tests/unit -v
+            --cov=app.voting --cov-report=term-missing --cov-fail-under=70
+            --junitxml=test-results/unit.xml
+      - store_test_results:
+          path: test-results
+
+  integration-tests:
+    docker:
+      - image: cimg/python:3.12.4
+      # Service containers. Same images as docker-compose.yml. They share the job's
+      # network, so they are reachable on localhost - NOT as "db" like in Compose.
+      - image: postgres:16-alpine
+        environment:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app
+      - image: redis:7-alpine
+    environment:
+      DATABASE_URL: postgresql://app:app@localhost:5432/app
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - checkout
+      - run: python -m pip install -r requirements-dev.txt
+      - run:
+          name: Wait until Postgres and Redis accept connections
+          command: |
+            python -c "
+            import os, sys, time
+            import psycopg, redis
+            for _ in range(30):
+                try:
+                    psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=2).close()
+                    redis.Redis.from_url(os.environ['REDIS_URL']).ping()
+                    print('services ready')
+                    sys.exit(0)
+                except Exception as exc:
+                    print('waiting:', type(exc).__name__)
+                    time.sleep(2)
+            sys.exit('Postgres/Redis never became ready')
+            "
+      - run:
+          name: Integration tests (real Postgres and Redis, no mocks)
+          command: python -m pytest tests/integration -v --junitxml=test-results/integration.xml
+      - store_test_results:
+          path: test-results
+
+  build-push:
+    parameters:
+      tag:
+        type: string          # the moving tag: qa, stage or prod
+    docker:
+      - image: cimg/base:stable
+    environment:
+      IMAGE_REPO: movie-night-python   # the repository name on Docker Hub
+    steps:
+      - checkout
+      - setup_remote_docker     # a job has no Docker daemon of its own; this lends it one
+      - run:
+          name: Log in to Docker Hub
+          command: echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+      - run:
+          name: Prepare a builder that can build for amd64 and arm64
+          command: |
+            docker buildx version
+            docker run --privileged --rm tonistiigi/binfmt --install arm64
+            docker buildx create --name multiarch --driver docker-container --use
+      - run:
+          name: Build and push << parameters.tag >> plus the immutable tag
+          command: |
+            IMAGE="$DOCKERHUB_USER/$IMAGE_REPO"
+            SHORT_SHA="$(echo "$CIRCLE_SHA1" | cut -c1-7)"
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --tag "$IMAGE:<< parameters.tag >>" \
+              --tag "$IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}" \
+              --push .
+            echo "Pushed $IMAGE:<< parameters.tag >> and $IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}"
+            docker buildx imagetools inspect "$IMAGE:<< parameters.tag >>"
 
 workflows:
-  verify-and-build:
+  qa:
+    when:
+      equal: [main, << pipeline.git.branch >>]
     jobs:
-      - qa:
-          filters:
-            branches:
-              only:
-                - feature/ci-docker-setup
-                - main
-                - staging
-                - prod
-      - build:
-          requires:
-            - qa
-          filters:
-            branches:
-              only:
-                - feature/ci-docker-setup
-                - main
+      - secret-scan
+      - lint:
+          requires: [secret-scan]
+      - unit-tests:
+          requires: [lint]
+      - integration-tests:
+          requires: [unit-tests]
+      - build-push:
+          tag: qa
+          requires: [integration-tests]
 
+  staging:
+    when:
+      equal: [staging, << pipeline.git.branch >>]
+    jobs:
+      - build-push:
+          tag: stage
+
+  prod:
+    when:
+      equal: [prod, << pipeline.git.branch >>]
+    jobs:
+      - build-push:
+          tag: prod
+
+  checks:
+    when:
+      not:
+        matches:
+          pattern: "^(main|staging|prod)$"
+          value: << pipeline.git.branch >>
+    jobs:
+      - secret-scan
+      - lint:
+          requires: [secret-scan]
+      - unit-tests:
+          requires: [lint]
+      - integration-tests:
+          requires: [unit-tests]

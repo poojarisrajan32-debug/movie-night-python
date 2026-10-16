@@ -1,0 +1,90 @@
+apiVersion: v1
+data:
+  001_schema.sql: |
+    CREATE TABLE IF NOT EXISTS polls (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        opened_by TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+        result JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        closed_at TIMESTAMPTZ);
+
+    CREATE TABLE IF NOT EXISTS films (
+        id SERIAL PRIMARY KEY,
+        poll_id INT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        added_by TEXT NOT NULL DEFAULT 'anonymous');
+    CREATE UNIQUE INDEX IF NOT EXISTS films_unique ON films (poll_id, lower(title));
+
+    CREATE TABLE IF NOT EXISTS ballots (
+        id SERIAL PRIMARY KEY,
+        poll_id INT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+        voter TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (poll_id, voter));
+
+    -- One row per preference. rank 1 is the voter's favourite. The unique
+    -- constraint on (ballot_id, film_id) is what stops a ballot ranking the same
+    -- film twice and quietly counting double.
+    CREATE TABLE IF NOT EXISTS ballot_choices (
+        ballot_id INT NOT NULL REFERENCES ballots(id) ON DELETE CASCADE,
+        rank INT NOT NULL CHECK (rank >= 1),
+        film_id INT NOT NULL REFERENCES films(id) ON DELETE CASCADE,
+        PRIMARY KEY (ballot_id, rank),
+        UNIQUE (ballot_id, film_id));
+
+    CREATE INDEX IF NOT EXISTS films_poll ON films (poll_id);
+    CREATE INDEX IF NOT EXISTS ballots_poll ON ballots (poll_id);
+  002_seed.sql: |
+    INSERT INTO polls (id, title, opened_by, status, created_at) VALUES
+     (1, 'Friday night, hostel common room', 'asha', 'open', now() - interval '2 hours'),
+     (2, 'Film society AGM - the deadlock', 'vikram', 'open', now() - interval '1 hour'),
+     (3, 'Last week (nobody added anything)', 'priya', 'open', now() - interval '8 days')
+    ON CONFLICT (id) DO NOTHING;
+    SELECT setval('polls_id_seq', GREATEST((SELECT MAX(id) FROM polls), 1));
+
+    -- Poll 1 is rigged, on purpose. Dune leads on first preferences 4-3-2-2 and
+    -- would win a simple "most votes" count. It does not win this one.
+    INSERT INTO films (id, poll_id, title, added_by) VALUES
+     (1, 1, 'Dune: Part Two', 'rahul'),
+     (2, 1, 'Spirited Away', 'asha'),
+     (3, 1, 'Paddington 2', 'fatima'),
+     (4, 1, 'The Matrix', 'vikram'),
+     (5, 2, 'Sholay', 'vikram'),
+     (6, 2, 'Pather Panchali', 'meera'),
+     (7, 2, 'Andaz Apna Apna', 'arjun')
+    ON CONFLICT (id) DO NOTHING;
+    SELECT setval('films_id_seq', GREATEST((SELECT MAX(id) FROM films), 1));
+
+    INSERT INTO ballots (id, poll_id, voter) VALUES
+     (1,1,'asha'),(2,1,'vikram'),(3,1,'priya'),(4,1,'rahul'),(5,1,'fatima'),(6,1,'arjun'),
+     (7,1,'meera'),(8,1,'dev'),(9,1,'nisha'),(10,1,'karthik'),(11,1,'sana'),
+     (12,2,'vikram'),(13,2,'meera'),(14,2,'arjun')
+    ON CONFLICT (id) DO NOTHING;
+    SELECT setval('ballots_id_seq', GREATEST((SELECT MAX(id) FROM ballots), 1));
+
+    -- Poll 1. Four voters put Dune first, three Spirited Away, two Paddington,
+    -- two The Matrix. Paddington and The Matrix are tied at the bottom: that is
+    -- the tie the brief asks you to defend. Both Paddington ballots name
+    -- Spirited Away next, and one Matrix voter ranked nothing else at all.
+    INSERT INTO ballot_choices (ballot_id, rank, film_id) VALUES
+     (1,1,1),(1,2,4),(1,3,2),
+     (2,1,1),(2,2,3),
+     (3,1,1),
+     (4,1,1),(4,2,2),
+     (5,1,2),(5,2,3),
+     (6,1,2),(6,2,1),
+     (7,1,2),(7,2,4),
+     (8,1,3),(8,2,2),(8,3,1),
+     (9,1,3),(9,2,2),
+     (10,1,4),(10,2,2),(10,3,1),
+     (11,1,4),
+    -- Poll 2. Three voters, three films, one first preference each, and every
+    -- ballot stops after its favourite. Nothing can ever break this.
+     (12,1,5),(13,1,6),(14,1,7)
+    ON CONFLICT DO NOTHING;
+kind: ConfigMap
+metadata:
+  name: migrations
+  namespace: qa

@@ -1,4 +1,5 @@
-"""Postgres access."""
+"""Postgres access. This is the end
+"""
 import os
 
 import psycopg

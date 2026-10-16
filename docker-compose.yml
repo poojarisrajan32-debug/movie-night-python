@@ -1,60 +1,52 @@
-
 services:
   db:
-    image: postgres:16.4-bookworm
+    image: postgres:16-alpine
     environment:
-      POSTGRES_DB: movienight
-      POSTGRES_USER: movienight
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_password}
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U movienight -d movienight"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7.4.2-bookworm
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 3s
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # One-shot job: applies migrations/*.sql in filename order, then exits (0 = success).
   migrate:
-    build: .
-    environment:
-      DATABASE_URL: postgresql://movienight:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/movienight
+    image: postgres:16-alpine
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
     command:
-      - /bin/sh
+      - sh
       - -c
       - |
-        set -eu
-        for file in /app/migrations/*.sql; do
-          if [ ! -f "$$file" ]; then
-            echo "No SQL migration files found"
-            exit 1
-          fi
-          echo "Applying $$file"
-          psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$$file"
+        set -e
+        for f in /migrations/*.sql; do
+          echo "applying $$f"
+          psql -v ON_ERROR_STOP=1 "postgresql://app:app@db:5432/app" -f "$$f"
         done
     restart: "no"
 
   app:
     build: .
-    environment:
-      DATABASE_URL: postgresql://movienight:${POSTGRES_PASSWORD:-local_dev_password}@db:5432/movienight
-      REDIS_URL: redis://redis:6379/0
     ports:
       - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/app
+      REDIS_URL: redis://redis:6379
     depends_on:
       db:
         condition: service_healthy
@@ -62,17 +54,6 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-    restart: unless-stopped
 
 volumes:
-  postgres_data:
+  pgdata:

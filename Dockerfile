@@ -1,18 +1,21 @@
+FROM python:3.12.4-slim
 
-FROM python:3.12.7-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client && rm -rf /var/lib/apt/lists/*
-
+# Dependencies first: this layer is cached until requirements.txt changes.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Unprivileged user; created after the install, switched to just before runtime.
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
+
 COPY app/ ./app/
-COPY migrations/ ./migrations/
-COPY tests/ ./tests/
+
+USER app
 
 EXPOSE 8080
 

@@ -96,6 +96,36 @@ def show_poll(pid: int):
             "ballots_cast": db.one("SELECT count(*) AS n FROM ballots WHERE poll_id=%s",
                                    (pid,))["n"]}
 
+@app.patch("/polls/{pid}")
+def rename_poll(pid: int, payload: dict = Body(...)):
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(400, "a poll needs a title")
+    if _poll(pid)["status"] != "open":
+        raise HTTPException(409, "that poll is closed - it can't be renamed")
+    # status='open' in the WHERE closes the gap between the check above and a
+    # close() that lands in between; zero rows back means we lost that race.
+    row = db.one("UPDATE polls SET title=%s WHERE id=%s AND status='open'"
+                 " RETURNING id, title, opened_by, status, created_at", (title, pid))
+    if not row:
+        raise HTTPException(409, "that poll was closed while you were renaming it")
+    return row
+
+@app.delete("/polls/{pid}", status_code=204)
+def delete_poll(pid: int):
+    c = cache.client()
+    # Same lock close() uses: a count in progress makes us back off, and a
+    # close() that starts while we delete backs off from us.
+    lock = f"lock:close:{pid}"
+    if not c.set(lock, "deleting", nx=True, ex=LOCK_TTL):
+        raise HTTPException(409, "a count is running for that poll - try again shortly")
+    try:
+        # Films, ballots and ballot_choices go with it (ON DELETE CASCADE).
+        if not db.one("DELETE FROM polls WHERE id=%s RETURNING id", (pid,)):
+            raise HTTPException(404, "no such poll")
+        cache.drop(f"poll:{pid}:first")  # Redis has no cascade
+    finally:
+        c.delete(lock)
 
 @app.post("/polls/{pid}/films", status_code=201)
 def add_film(pid: int, payload: dict = Body(...)):
